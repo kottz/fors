@@ -125,18 +125,59 @@ pub fn stream_to_writer(
     let mut current_url = media_url.clone();
     let mut logged_ads: HashSet<String> = HashSet::new();
     let mut ad_hold = false;
+    let mut had_content = false;
+    let mut consecutive_errors = 0u32;
 
     loop {
-        let response = client
-            .get(current_url.clone())
-            .send()
-            .context("Failed to fetch media playlist")?
-            .error_for_status()
-            .context("Media playlist request failed")?;
+        let response = match client.get(current_url.clone()).send() {
+            Ok(resp) => resp,
+            Err(err) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 && had_content {
+                    info!("Stream ended (failed to reload playlist after errors)");
+                    break;
+                }
+                debug!("Failed to fetch media playlist: {err}");
+                std::thread::sleep(Duration::from_millis(750));
+                continue;
+            }
+        };
+
+        if !response.status().is_success() {
+            consecutive_errors += 1;
+            if response.status().as_u16() == 404 && had_content {
+                info!("Stream ended (playlist not found)");
+                break;
+            }
+            if consecutive_errors >= 3 && had_content {
+                info!("Stream ended (playlist unavailable)");
+                break;
+            }
+            debug!(
+                "Media playlist returned status {} - retrying",
+                response.status()
+            );
+            std::thread::sleep(Duration::from_millis(750));
+            continue;
+        }
+
+        consecutive_errors = 0;
 
         let playlist_url = response.url().clone();
         let body = response.text().context("Reading media playlist failed")?;
-        let playlist = parse_media_playlist(&playlist_url, &body, low_latency)?;
+        let playlist = match parse_media_playlist(&playlist_url, &body, low_latency) {
+            Ok(pl) => pl,
+            Err(err) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 && had_content {
+                    info!("Stream ended (unreadable playlist)");
+                    break;
+                }
+                debug!("Failed to parse media playlist: {err}");
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
 
         let mut wrote_segment = false;
 
@@ -185,6 +226,8 @@ pub fn stream_to_writer(
                 wrote_segment = true;
                 continue;
             }
+
+            had_content = true;
 
             debug!(
                 "Downloading segment {}{}{} ({}s) {}",
