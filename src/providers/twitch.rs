@@ -20,6 +20,7 @@ pub enum TwitchTarget {
 
 pub struct TwitchSource {
     target: TwitchTarget,
+    low_latency: bool,
 }
 
 pub fn is_twitch_url(url: &Url) -> bool {
@@ -29,7 +30,7 @@ pub fn is_twitch_url(url: &Url) -> bool {
 }
 
 impl TwitchSource {
-    pub fn from_url(url: Url) -> Result<Self> {
+    pub fn from_url(url: Url, low_latency: bool) -> Result<Self> {
         let segments: Vec<String> = url
             .path_segments()
             .map(|segments| {
@@ -47,12 +48,14 @@ impl TwitchSource {
                 .ok_or_else(|| anyhow!("Missing VOD id in URL"))?;
             Ok(TwitchSource {
                 target: TwitchTarget::Vod { id },
+                low_latency,
             })
         } else if let Some(channel) = segments.first() {
             Ok(TwitchSource {
                 target: TwitchTarget::Live {
                     channel: channel.clone(),
                 },
+                low_latency,
             })
         } else {
             bail!("Invalid Twitch URL: {}", url);
@@ -78,7 +81,11 @@ impl TwitchSource {
         let variants = parse_master_playlist(&playlist_url, &body)?;
 
         let is_live = matches!(self.target, TwitchTarget::Live { .. });
-        Ok(StreamSet { variants, is_live })
+        Ok(StreamSet {
+            variants,
+            is_live,
+            low_latency: self.low_latency,
+        })
     }
 
     fn fetch_access_token(&self, client: &Client) -> Result<AccessToken> {
@@ -159,10 +166,15 @@ impl TwitchSource {
         let encoded = urlencoding::encode(&token.value);
         let url = match &self.target {
             TwitchTarget::Live { channel } => format!(
-                "https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={token}&allow_source=true&allow_audio_only=true&allow_spectre=true&player=twitchweb&client_id={client}",
+                "https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8?sig={sig}&token={token}&allow_source=true&allow_audio_only=true&allow_spectre=true&player=twitchweb&client_id={client}{fast_bread}",
                 sig = token.signature,
                 token = encoded,
                 client = CLIENT_ID,
+                fast_bread = if self.low_latency {
+                    "&fast_bread=true"
+                } else {
+                    ""
+                },
             ),
             TwitchTarget::Vod { id } => format!(
                 "https://usher.ttvnw.net/vod/{id}.m3u8?sig={sig}&token={token}&allow_source=true&allow_spectre=true&player=twitchweb&client_id={client}",

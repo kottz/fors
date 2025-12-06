@@ -28,6 +28,7 @@ struct MediaSegment {
     uri: Url,
     sequence: u64,
     duration: f64,
+    prefetch: bool,
 }
 
 pub fn parse_master_playlist(base_url: &Url, body: &str) -> Result<Vec<StreamVariant>> {
@@ -108,6 +109,7 @@ pub fn stream_to_writer(
     media_url: &Url,
     writer: &mut dyn Write,
     is_live: bool,
+    low_latency: bool,
 ) -> Result<()> {
     let mut last_sequence: Option<u64> = None;
     let mut current_url = media_url.clone();
@@ -122,7 +124,7 @@ pub fn stream_to_writer(
 
         let playlist_url = response.url().clone();
         let body = response.text().context("Reading media playlist failed")?;
-        let playlist = parse_media_playlist(&playlist_url, &body)?;
+        let playlist = parse_media_playlist(&playlist_url, &body, low_latency)?;
 
         let mut wrote_segment = false;
 
@@ -134,8 +136,11 @@ pub fn stream_to_writer(
             }
 
             debug!(
-                "Downloading segment {} ({}s) {}",
-                segment.sequence, segment.duration, segment.uri
+                "Downloading segment {}{} ({}s) {}",
+                segment.sequence,
+                if segment.prefetch { " (prefetch)" } else { "" },
+                segment.duration,
+                segment.uri
             );
             let mut segment_response = client
                 .get(segment.uri.clone())
@@ -162,19 +167,21 @@ pub fn stream_to_writer(
         }
 
         current_url = playlist_url;
-        let sleep_ms = ((playlist.target_duration * 750.0).max(500.0)) as u64;
+        let reload = if low_latency { 0.4 } else { 0.75 };
+        let sleep_ms = ((playlist.target_duration * 1000.0 * reload).max(300.0)) as u64;
         std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
     Ok(())
 }
 
-fn parse_media_playlist(base_url: &Url, body: &str) -> Result<MediaPlaylist> {
+fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result<MediaPlaylist> {
     let mut target_duration = 4.0;
     let mut media_sequence: u64 = 0;
     let mut end_list = false;
     let mut segments = Vec::new();
     let mut pending_duration: Option<f64> = None;
+    let mut last_duration: Option<f64> = None;
 
     for line in body.lines().map(str::trim) {
         if line.starts_with("#EXT-X-TARGETDURATION:") {
@@ -193,8 +200,21 @@ fn parse_media_playlist(base_url: &Url, body: &str) -> Result<MediaPlaylist> {
             let value = line.trim_start_matches("#EXTINF:");
             let duration_part = value.split(',').next().unwrap_or(value);
             pending_duration = duration_part.parse::<f64>().ok();
+            last_duration = pending_duration;
         } else if line.starts_with("#EXT-X-TWITCH-PREFETCH:") {
-            // ignore prefetch segments for now
+            if !low_latency {
+                continue;
+            }
+            let uri = resolve_url(base_url, line.trim_start_matches("#EXT-X-TWITCH-PREFETCH:"))
+                .with_context(|| format!("Resolving prefetch segment URL: {line}"))?;
+            let sequence = media_sequence + segments.len() as u64;
+            let duration = last_duration.unwrap_or(target_duration);
+            segments.push(MediaSegment {
+                uri,
+                sequence,
+                duration,
+                prefetch: true,
+            });
             continue;
         } else if line.starts_with("#EXT-X-ENDLIST") {
             end_list = true;
@@ -208,6 +228,7 @@ fn parse_media_playlist(base_url: &Url, body: &str) -> Result<MediaPlaylist> {
                 uri,
                 sequence,
                 duration,
+                prefetch: false,
             });
         }
     }

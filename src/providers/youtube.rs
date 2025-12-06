@@ -72,6 +72,7 @@ impl YouTubeSource {
         Ok(StreamSet {
             variants,
             is_live: true,
+            low_latency: false,
         })
     }
 }

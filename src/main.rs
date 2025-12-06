@@ -81,7 +81,13 @@ fn main() -> Result<()> {
     };
 
     info!("Streaming {} ({})", variant.label, variant.uri);
-    stream_to_writer(&client, &variant.uri, &mut writer, streams.is_live, streams.low_latency)?;
+    stream_to_writer(
+        &client,
+        &variant.uri,
+        &mut writer,
+        streams.is_live,
+        streams.low_latency,
+    )?;
 
     Ok(())
 }
