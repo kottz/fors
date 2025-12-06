@@ -123,8 +123,8 @@ pub fn stream_to_writer(
 ) -> Result<()> {
     let mut last_sequence: Option<u64> = None;
     let mut current_url = media_url.clone();
-    let mut ad_filtering = false;
     let mut logged_ads: HashSet<String> = HashSet::new();
+    let mut ad_hold = false;
 
     loop {
         let response = client
@@ -154,6 +154,22 @@ pub fn stream_to_writer(
             }
         }
 
+        let playlist_all_ads =
+            !playlist.segments.is_empty() && playlist.segments.iter().all(|s| s.ad);
+        if playlist_all_ads || !playlist.ads.is_empty() {
+            if !ad_hold {
+                info!("Filtering out segments and pausing stream output");
+            }
+            ad_hold = true;
+        } else if ad_hold && playlist.segments.iter().any(|s| !s.ad) {
+            info!("Resuming stream output");
+            ad_hold = false;
+            // skip past ad sequences
+            if let Some(max_seq) = playlist.segments.iter().map(|s| s.sequence).max() {
+                last_sequence = Some(max_seq);
+            }
+        }
+
         for segment in playlist.segments {
             if let Some(last) = last_sequence {
                 if segment.sequence <= last {
@@ -161,19 +177,13 @@ pub fn stream_to_writer(
                 }
             }
 
-            if segment.ad {
-                if !ad_filtering {
-                    info!("Filtering out segments and pausing stream output");
-                    ad_filtering = true;
-                }
+            if ad_hold || segment.ad {
+                // stay silent during ad segments but keep polling playlists
                 if segment.discontinuity {
                     log::warn!("Encountered a stream discontinuity while filtering ads");
                 }
-                wrote_segment = true; // keep polling playlists while ads are present
+                wrote_segment = true;
                 continue;
-            } else if ad_filtering {
-                info!("Resuming stream output");
-                ad_filtering = false;
             }
 
             debug!(
@@ -227,6 +237,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
     let mut end_list = false;
     let mut segments = Vec::new();
     let mut pending_duration: Option<f64> = None;
+    let mut pending_title: Option<String> = None;
     let mut last_duration: Option<f64> = None;
     let mut discontinuity_next = false;
     let mut ad_state: Option<AdState> = None;
@@ -247,8 +258,14 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             }
         } else if line.starts_with("#EXTINF:") {
             let value = line.trim_start_matches("#EXTINF:");
-            let duration_part = value.split(',').next().unwrap_or(value);
-            pending_duration = duration_part.parse::<f64>().ok();
+            let mut parts = value.splitn(2, ',');
+            if let Some(duration_part) = parts.next() {
+                pending_duration = duration_part.parse::<f64>().ok();
+            }
+            pending_title = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             last_duration = pending_duration;
         } else if line.starts_with("#EXT-X-DISCONTINUITY") {
             discontinuity_next = true;
@@ -291,7 +308,13 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             let uri = resolve_url(base_url, line)
                 .with_context(|| format!("Resolving segment URL: {line}"))?;
             let sequence = media_sequence + segments.len() as u64;
-            let ad_flag = consume_ad_state(&mut ad_state);
+            let mut ad_flag = consume_ad_state(&mut ad_state);
+            if let Some(t) = pending_title.take() {
+                let t_low = t.to_ascii_lowercase();
+                if t_low.contains("amazon") || t_low.contains("stitched-ad") {
+                    ad_flag = true;
+                }
+            }
             segments.push(MediaSegment {
                 uri,
                 sequence,
