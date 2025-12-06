@@ -80,6 +80,11 @@ impl TwitchSource {
             .context("Failed to read Twitch playlist body")?;
         let variants = parse_master_playlist(&playlist_url, &body)?;
 
+        info!("Will skip Twitch ad segments");
+        if self.low_latency {
+            info!("Low latency streaming (prefetch segments enabled)");
+        }
+
         let is_live = matches!(self.target, TwitchTarget::Live { .. });
         Ok(StreamSet {
             variants,

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use reqwest::blocking::Client;
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::Duration;
 use url::Url;
@@ -21,6 +22,7 @@ struct MediaPlaylist {
     target_duration: f64,
     end_list: bool,
     segments: Vec<MediaSegment>,
+    ads: Vec<AdNotice>,
 }
 
 #[derive(Debug)]
@@ -29,6 +31,14 @@ struct MediaSegment {
     sequence: u64,
     duration: f64,
     prefetch: bool,
+    ad: bool,
+    discontinuity: bool,
+}
+
+#[derive(Debug)]
+struct AdNotice {
+    id: String,
+    duration: Option<f64>,
 }
 
 pub fn parse_master_playlist(base_url: &Url, body: &str) -> Result<Vec<StreamVariant>> {
@@ -113,6 +123,8 @@ pub fn stream_to_writer(
 ) -> Result<()> {
     let mut last_sequence: Option<u64> = None;
     let mut current_url = media_url.clone();
+    let mut ad_filtering = false;
+    let mut logged_ads: HashSet<String> = HashSet::new();
 
     loop {
         let response = client
@@ -128,6 +140,20 @@ pub fn stream_to_writer(
 
         let mut wrote_segment = false;
 
+        for ad in &playlist.ads {
+            if logged_ads.insert(ad.id.clone()) {
+                if let Some(duration) = ad.duration {
+                    info!(
+                        "Detected advertisement break of {} second{}",
+                        duration.ceil() as u64,
+                        if duration.ceil() as u64 == 1 { "" } else { "s" },
+                    );
+                } else {
+                    info!("Detected advertisement break");
+                }
+            }
+        }
+
         for segment in playlist.segments {
             if let Some(last) = last_sequence {
                 if segment.sequence <= last {
@@ -135,10 +161,30 @@ pub fn stream_to_writer(
                 }
             }
 
+            if segment.ad {
+                if !ad_filtering {
+                    info!("Filtering out segments and pausing stream output");
+                    ad_filtering = true;
+                }
+                if segment.discontinuity {
+                    log::warn!("Encountered a stream discontinuity while filtering ads");
+                }
+                wrote_segment = true; // keep polling playlists while ads are present
+                continue;
+            } else if ad_filtering {
+                info!("Resuming stream output");
+                ad_filtering = false;
+            }
+
             debug!(
-                "Downloading segment {}{} ({}s) {}",
+                "Downloading segment {}{}{} ({}s) {}",
                 segment.sequence,
                 if segment.prefetch { " (prefetch)" } else { "" },
+                if segment.discontinuity {
+                    " (discontinuity)"
+                } else {
+                    ""
+                },
                 segment.duration,
                 segment.uri
             );
@@ -182,6 +228,9 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
     let mut segments = Vec::new();
     let mut pending_duration: Option<f64> = None;
     let mut last_duration: Option<f64> = None;
+    let mut discontinuity_next = false;
+    let mut ad_state: Option<AdState> = None;
+    let mut ads = Vec::new();
 
     for line in body.lines().map(str::trim) {
         if line.starts_with("#EXT-X-TARGETDURATION:") {
@@ -201,6 +250,8 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             let duration_part = value.split(',').next().unwrap_or(value);
             pending_duration = duration_part.parse::<f64>().ok();
             last_duration = pending_duration;
+        } else if line.starts_with("#EXT-X-DISCONTINUITY") {
+            discontinuity_next = true;
         } else if line.starts_with("#EXT-X-TWITCH-PREFETCH:") {
             if !low_latency {
                 continue;
@@ -209,13 +260,29 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
                 .with_context(|| format!("Resolving prefetch segment URL: {line}"))?;
             let sequence = media_sequence + segments.len() as u64;
             let duration = last_duration.unwrap_or(target_duration);
+            let ad_flag = consume_ad_state(&mut ad_state);
             segments.push(MediaSegment {
                 uri,
                 sequence,
                 duration,
                 prefetch: true,
+                ad: ad_flag,
+                discontinuity: discontinuity_next,
             });
+            if discontinuity_next {
+                discontinuity_next = false;
+            }
             continue;
+        } else if line.starts_with("#EXT-X-DATERANGE:") {
+            if let Some(ad) = parse_daterange(line, last_duration, target_duration) {
+                if let Some(id) = ad.id.clone() {
+                    ads.push(AdNotice {
+                        id,
+                        duration: ad.duration,
+                    });
+                }
+                ad_state = Some(ad);
+            }
         } else if line.starts_with("#EXT-X-ENDLIST") {
             end_list = true;
         } else if line.starts_with('#') {
@@ -224,12 +291,18 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             let uri = resolve_url(base_url, line)
                 .with_context(|| format!("Resolving segment URL: {line}"))?;
             let sequence = media_sequence + segments.len() as u64;
+            let ad_flag = consume_ad_state(&mut ad_state);
             segments.push(MediaSegment {
                 uri,
                 sequence,
                 duration,
                 prefetch: false,
+                ad: ad_flag,
+                discontinuity: discontinuity_next,
             });
+            if discontinuity_next {
+                discontinuity_next = false;
+            }
         }
     }
 
@@ -241,6 +314,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
         target_duration,
         end_list,
         segments,
+        ads,
     })
 }
 
@@ -286,6 +360,72 @@ fn parse_attribute_line(value: &str) -> Vec<(String, String)> {
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct AdState {
+    remaining_segments: u32,
+    id: Option<String>,
+    duration: Option<f64>,
+}
+
+fn consume_ad_state(ad_state: &mut Option<AdState>) -> bool {
+    if let Some(state) = ad_state.as_mut() {
+        if state.remaining_segments > 0 {
+            state.remaining_segments -= 1;
+        }
+        if state.remaining_segments == 0 {
+            *ad_state = None;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+fn parse_daterange(
+    line: &str,
+    last_duration: Option<f64>,
+    target_duration: f64,
+) -> Option<AdState> {
+    let attrs = line.trim_start_matches("#EXT-X-DATERANGE:");
+    let pairs = parse_attribute_line(attrs);
+    let mut class = None;
+    let mut id = None;
+    let mut duration = None;
+    let mut ad_id = None;
+
+    for (k, v) in pairs {
+        match k.as_str() {
+            "CLASS" => class = Some(v),
+            "ID" => id = Some(v),
+            "DURATION" => duration = v.parse::<f64>().ok(),
+            "X-TV-TWITCH-AD-COMMERCIAL-ID" | "X-TV-TWITCH-AD-ROLL-TYPE" => ad_id = Some(v),
+            _ => {}
+        }
+    }
+
+    let is_ad = class.as_deref() == Some("twitch-stitched-ad")
+        || id
+            .as_deref()
+            .map(|id| id.starts_with("stitched-ad-"))
+            .unwrap_or(false);
+
+    if !is_ad {
+        return None;
+    }
+
+    let seg_duration = last_duration.unwrap_or(target_duration).max(0.1);
+    let remaining_segments = duration
+        .map(|d| (d / seg_duration).ceil() as u32)
+        .filter(|n| *n > 0)
+        .unwrap_or(6);
+
+    Some(AdState {
+        remaining_segments,
+        id: ad_id.or(id),
+        duration,
+    })
 }
 
 fn parse_resolution(value: &str) -> Option<(u64, u64)> {
