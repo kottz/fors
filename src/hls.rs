@@ -127,6 +127,7 @@ pub fn stream_to_writer(
     let mut ad_hold = false;
     let mut had_content = false;
     let mut consecutive_errors = 0u32;
+    let mut ad_discontinuity_logged = false;
 
     loop {
         let response = match client.get(current_url.clone()).send() {
@@ -205,6 +206,7 @@ pub fn stream_to_writer(
         } else if ad_hold && playlist.segments.iter().any(|s| !s.ad) {
             info!("Resuming stream output");
             ad_hold = false;
+            ad_discontinuity_logged = false;
             // skip past ad sequences
             if let Some(max_seq) = playlist.segments.iter().map(|s| s.sequence).max() {
                 last_sequence = Some(max_seq);
@@ -220,8 +222,9 @@ pub fn stream_to_writer(
 
             if ad_hold || segment.ad {
                 // stay silent during ad segments but keep polling playlists
-                if segment.discontinuity {
+                if segment.discontinuity && !ad_discontinuity_logged {
                     log::warn!("Encountered a stream discontinuity while filtering ads");
+                    ad_discontinuity_logged = true;
                 }
                 wrote_segment = true;
                 continue;
