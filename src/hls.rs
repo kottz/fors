@@ -128,6 +128,7 @@ pub fn stream_to_writer(
     let mut had_content = false;
     let mut consecutive_errors = 0u32;
     let mut ad_discontinuity_logged = false;
+    let mut initial = true;
 
     loop {
         let response = match client.get(current_url.clone()).send() {
@@ -181,6 +182,20 @@ pub fn stream_to_writer(
         };
 
         let mut wrote_segment = false;
+
+        // Fast-start: on first load of a live playlist, jump to the latest edge rather than older segments
+        if initial && is_live {
+            if let Some(max_seq) = playlist.segments.iter().map(|s| s.sequence).max() {
+                let live_edge = if low_latency { 2 } else { 3 };
+                last_sequence = Some(max_seq.saturating_sub(live_edge));
+                debug!(
+                    "Starting near live edge at sequence {} (max {})",
+                    last_sequence.unwrap_or(0),
+                    max_seq
+                );
+            }
+            initial = false;
+        }
 
         for ad in &playlist.ads {
             if logged_ads.insert(ad.id.clone()) {
