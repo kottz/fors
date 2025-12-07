@@ -222,10 +222,6 @@ pub fn stream_to_writer(
             info!("Resuming stream output");
             ad_hold = false;
             ad_discontinuity_logged = false;
-            // skip past ad sequences
-            if let Some(max_seq) = playlist.segments.iter().map(|s| s.sequence).max() {
-                last_sequence = Some(max_seq);
-            }
         }
 
         for segment in playlist.segments {
@@ -242,6 +238,7 @@ pub fn stream_to_writer(
                     ad_discontinuity_logged = true;
                 }
                 wrote_segment = true;
+                last_sequence = Some(segment.sequence);
                 continue;
             }
 
