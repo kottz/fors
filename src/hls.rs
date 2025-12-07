@@ -124,10 +124,8 @@ pub fn stream_to_writer(
     let mut last_sequence: Option<u64> = None;
     let mut current_url = media_url.clone();
     let mut logged_ads: HashSet<String> = HashSet::new();
-    let mut ad_hold = false;
     let mut had_content = false;
     let mut consecutive_errors = 0u32;
-    let mut ad_discontinuity_logged = false;
     let mut initial = true;
 
     loop {
@@ -211,31 +209,19 @@ pub fn stream_to_writer(
             }
         }
 
-        let playlist_all_ads =
-            !playlist.segments.is_empty() && playlist.segments.iter().all(|s| s.ad);
-        if playlist_all_ads || !playlist.ads.is_empty() {
-            if !ad_hold {
-                info!("Filtering out segments and pausing stream output");
-            }
-            ad_hold = true;
-        } else if ad_hold && playlist.segments.iter().any(|s| !s.ad) {
-            info!("Resuming stream output");
-            ad_hold = false;
-            ad_discontinuity_logged = false;
-        }
-
-        for segment in playlist.segments {
+        let mut warned_discontinuity = false;
+        for segment in &playlist.segments {
             if let Some(last) = last_sequence {
                 if segment.sequence <= last {
                     continue;
                 }
             }
 
-            if ad_hold || segment.ad {
+            if segment.ad {
                 // stay silent during ad segments but keep polling playlists
-                if segment.discontinuity && !ad_discontinuity_logged {
+                if segment.discontinuity && !warned_discontinuity {
                     log::warn!("Encountered a stream discontinuity while filtering ads");
-                    ad_discontinuity_logged = true;
+                    warned_discontinuity = true;
                 }
                 wrote_segment = true;
                 last_sequence = Some(segment.sequence);
@@ -281,8 +267,20 @@ pub fn stream_to_writer(
         }
 
         current_url = playlist_url;
-        let reload = if low_latency { 0.4 } else { 0.75 };
-        let sleep_ms = ((playlist.target_duration * 1000.0 * reload).max(300.0)) as u64;
+        // Use last real segment duration when available; otherwise target duration scaled
+        let last_dur = playlist
+            .segments
+            .iter()
+            .rev()
+            .find(|s| s.duration > 0.0)
+            .map(|s| s.duration)
+            .unwrap_or(playlist.target_duration);
+        let reload = if low_latency {
+            last_dur
+        } else {
+            playlist.target_duration * 0.75
+        };
+        let sleep_ms = ((reload * 1000.0).max(300.0)) as u64;
         std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
@@ -339,7 +337,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             segments.push(MediaSegment {
                 uri,
                 sequence,
-                duration,
+                duration: if ad_flag { 0.0 } else { duration },
                 prefetch: true,
                 ad: ad_flag,
                 discontinuity: discontinuity_next,
@@ -376,7 +374,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             segments.push(MediaSegment {
                 uri,
                 sequence,
-                duration,
+                duration: if ad_flag { 0.0 } else { duration },
                 prefetch: false,
                 ad: ad_flag,
                 discontinuity: discontinuity_next,
@@ -448,6 +446,7 @@ struct AdState {
     remaining_segments: u32,
     id: Option<String>,
     duration: Option<f64>,
+    // no exact daterange timing, but track presence
 }
 
 fn consume_ad_state(ad_state: &mut Option<AdState>) -> bool {
