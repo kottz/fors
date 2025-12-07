@@ -6,7 +6,9 @@ use serde_json::json;
 use url::Url;
 
 use super::StreamSet;
+mod cache;
 use crate::hls::parse_master_playlist;
+use cache::Cache;
 
 const CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 const GQL_ENDPOINT: &str = "https://gql.twitch.tv/gql";
@@ -21,6 +23,7 @@ pub enum TwitchTarget {
 pub struct TwitchSource {
     target: TwitchTarget,
     low_latency: bool,
+    use_cache: bool,
 }
 
 pub fn is_twitch_url(url: &Url) -> bool {
@@ -30,7 +33,7 @@ pub fn is_twitch_url(url: &Url) -> bool {
 }
 
 impl TwitchSource {
-    pub fn from_url(url: Url, low_latency: bool) -> Result<Self> {
+    pub fn from_url(url: Url, low_latency: bool, use_cache: bool) -> Result<Self> {
         let segments: Vec<String> = url
             .path_segments()
             .map(|segments| {
@@ -49,6 +52,7 @@ impl TwitchSource {
             Ok(TwitchSource {
                 target: TwitchTarget::Vod { id },
                 low_latency,
+                use_cache,
             })
         } else if let Some(channel) = segments.first() {
             Ok(TwitchSource {
@@ -56,6 +60,7 @@ impl TwitchSource {
                     channel: channel.clone(),
                 },
                 low_latency,
+                use_cache,
             })
         } else {
             bail!("Invalid Twitch URL: {}", url);
@@ -63,8 +68,20 @@ impl TwitchSource {
     }
 
     pub fn load_streams(&self, client: &Client) -> Result<StreamSet> {
-        let token = self.fetch_access_token(client)?;
-        let manifest_url = self.build_manifest_url(&token)?;
+        let cache = Cache::new()?;
+        let cached_manifest = if self.use_cache {
+            cache.load_manifest_url(&self.target)
+        } else {
+            None
+        };
+
+        let token = self.fetch_access_token(client, &cache)?;
+        let manifest_url = cached_manifest
+            .and_then(|url| Url::parse(&url).ok())
+            .unwrap_or_else(|| {
+                self.build_manifest_url(&token)
+                    .expect("Failed to build manifest URL")
+            });
 
         let response = client
             .get(manifest_url.clone())
@@ -80,6 +97,10 @@ impl TwitchSource {
             .context("Failed to read Twitch playlist body")?;
         let variants = parse_master_playlist(&playlist_url, &body)?;
 
+        if self.use_cache {
+            cache.store_manifest_url(&self.target, playlist_url.as_str());
+        }
+
         info!("Will skip Twitch ad segments");
         if self.low_latency {
             info!("Low latency streaming (prefetch segments enabled)");
@@ -93,7 +114,16 @@ impl TwitchSource {
         })
     }
 
-    fn fetch_access_token(&self, client: &Client) -> Result<AccessToken> {
+    fn fetch_access_token(&self, client: &Client, cache: &Cache) -> Result<AccessToken> {
+        if self.use_cache {
+            if let Some((sig, token)) = cache.load_token(&self.target) {
+                return Ok(AccessToken {
+                    signature: sig,
+                    value: token,
+                });
+            }
+        }
+
         let variables = match &self.target {
             TwitchTarget::Live { channel } => json!({
                 "isLive": true,
@@ -157,14 +187,20 @@ impl TwitchSource {
         )
         .context("Malformed Twitch access token response")?;
 
-        match &self.target {
+        let token = match &self.target {
             TwitchTarget::Live { .. } => data
                 .streamPlaybackAccessToken
                 .ok_or_else(|| anyhow!("No access token returned for live channel")),
             TwitchTarget::Vod { .. } => data
                 .videoPlaybackAccessToken
                 .ok_or_else(|| anyhow!("No access token returned for VOD")),
+        }?;
+
+        if self.use_cache {
+            cache.store_token(&self.target, &token);
         }
+
+        Ok(token)
     }
 
     fn build_manifest_url(&self, token: &AccessToken) -> Result<Url> {

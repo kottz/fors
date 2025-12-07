@@ -46,6 +46,10 @@ struct Cli {
     /// Enable Twitch low latency mode (prefetch HLS segments)
     #[arg(long, action = ArgAction::SetTrue)]
     twitch_low_latency: bool,
+
+    /// Use on-disk cache to speed up startup (tokens/playlists)
+    #[arg(long, action = ArgAction::SetTrue)]
+    cache: bool,
 }
 
 fn main() -> Result<()> {
@@ -56,7 +60,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let client = build_client(cli.user_agent.clone())?;
 
-    let provider = Provider::from_url(&cli.url, cli.twitch_low_latency)?;
+    let provider = Provider::from_url(&cli.url, cli.twitch_low_latency, cli.cache)?;
     info!("Selected provider: {}", provider.name());
 
     let streams = provider.load_streams(&client)?;

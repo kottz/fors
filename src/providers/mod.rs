@@ -19,11 +19,11 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn from_url(input: &str, twitch_low_latency: bool) -> Result<Self> {
+    pub fn from_url(input: &str, twitch_low_latency: bool, cache: bool) -> Result<Self> {
         let url = Url::parse(input)?;
 
         if twitch::is_twitch_url(&url) {
-            let source = twitch::TwitchSource::from_url(url, twitch_low_latency)?;
+            let source = twitch::TwitchSource::from_url(url, twitch_low_latency, cache)?;
             Ok(Provider::Twitch(source))
         } else if youtube::is_youtube_url(&url) {
             let source = youtube::YouTubeSource::from_url(url)?;
