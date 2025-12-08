@@ -28,6 +28,7 @@ struct MediaPlaylist {
 #[derive(Debug)]
 struct MediaSegment {
     uri: Url,
+    init: Option<Url>,
     sequence: u64,
     duration: f64,
     prefetch: bool,
@@ -126,6 +127,7 @@ pub fn stream_to_writer(
     let mut logged_ads: HashSet<String> = HashSet::new();
     let mut had_content = false;
     let mut consecutive_errors = 0u32;
+    let mut last_init: Option<Url> = None;
     let mut initial = true;
 
     loop {
@@ -228,7 +230,29 @@ pub fn stream_to_writer(
                 continue;
             }
 
-            had_content = true;
+            if let Some(init_url) = &segment.init {
+                let needs_init = last_init
+                    .as_ref()
+                    .map(|url| url != init_url)
+                    .unwrap_or(true);
+                if needs_init {
+                    debug!("Downloading initialization segment {}", init_url);
+                    let mut init_response = client
+                        .get(init_url.clone())
+                        .send()
+                        .with_context(|| format!("Requesting initialization segment {}", init_url))?
+                        .error_for_status()
+                        .with_context(|| {
+                            format!("Initialization segment download failed: {}", init_url)
+                        })?;
+                    std::io::copy(&mut init_response, writer)
+                        .context("Writing initialization segment failed")?;
+                    writer.flush().ok();
+                    last_init = Some(init_url.clone());
+                    had_content = true;
+                    wrote_segment = true;
+                }
+            }
 
             debug!(
                 "Downloading segment {}{}{} ({}s) {}",
@@ -253,7 +277,12 @@ pub fn stream_to_writer(
                 .context("Writing segment to output failed")?;
             writer.flush().ok();
             last_sequence = Some(segment.sequence);
-            wrote_segment = true;
+            if !had_content {
+                had_content = true;
+            }
+            if !wrote_segment {
+                wrote_segment = true;
+            }
         }
 
         if playlist.end_list && !is_live {
@@ -298,6 +327,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
     let mut discontinuity_next = false;
     let mut ad_state: Option<AdState> = None;
     let mut ads = Vec::new();
+    let mut current_init: Option<Url> = None;
 
     for line in body.lines().map(str::trim) {
         if line.starts_with("#EXT-X-TARGETDURATION:") {
@@ -336,6 +366,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             let ad_flag = consume_ad_state(&mut ad_state);
             segments.push(MediaSegment {
                 uri,
+                init: current_init.clone(),
                 sequence,
                 duration: if ad_flag { 0.0 } else { duration },
                 prefetch: true,
@@ -358,6 +389,13 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             }
         } else if line.starts_with("#EXT-X-ENDLIST") {
             end_list = true;
+        } else if line.starts_with("#EXT-X-MAP:") {
+            let attrs = parse_attribute_line(line.trim_start_matches("#EXT-X-MAP:"));
+            if let Some((_, uri_value)) = attrs.iter().find(|(k, _)| k == "URI") {
+                let map_url = resolve_url(base_url, uri_value)
+                    .with_context(|| format!("Resolving init segment URL: {uri_value}"))?;
+                current_init = Some(map_url);
+            }
         } else if line.starts_with('#') {
             continue;
         } else if let Some(duration) = pending_duration.take() {
@@ -373,6 +411,7 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             }
             segments.push(MediaSegment {
                 uri,
+                init: current_init.clone(),
                 sequence,
                 duration: if ad_flag { 0.0 } else { duration },
                 prefetch: false,
