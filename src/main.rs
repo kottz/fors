@@ -17,7 +17,7 @@ use crate::hls::{StreamVariant, stream_to_writer};
 #[command(
     author,
     version,
-    about = "A lightweight Rust port of streamlink supporting Twitch and YouTube"
+    about = "A lightweight stream fetcher supporting Twitch and YouTube"
 )]
 struct Cli {
     /// Stream URL
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
 
 fn build_client(user_agent: Option<String>) -> Result<Client> {
     let mut headers = HeaderMap::new();
-    let agent = user_agent.unwrap_or_else(|| "streamlink-rs/0.1".to_string());
+    let agent = user_agent.unwrap_or_else(|| "fors/0.1".to_string());
     headers.insert(
         USER_AGENT,
         HeaderValue::from_str(&agent).context("Invalid user agent value")?,

@@ -40,7 +40,7 @@ impl Cache {
     pub fn new() -> Result<Self> {
         let path = dirs::cache_dir()
             .unwrap_or_else(|| std::env::temp_dir())
-            .join("streamlink-rs")
+            .join("fors")
             .join("twitch_cache.json");
 
         let data = fs::read(&path)
