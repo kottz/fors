@@ -115,13 +115,13 @@ impl TwitchSource {
     }
 
     fn fetch_access_token(&self, client: &Client, cache: &Cache) -> Result<AccessToken> {
-        if self.use_cache {
-            if let Some((sig, token)) = cache.load_token(&self.target) {
-                return Ok(AccessToken {
-                    signature: sig,
-                    value: token,
-                });
-            }
+        if self.use_cache
+            && let Some((sig, token)) = cache.load_token(&self.target)
+        {
+            return Ok(AccessToken {
+                signature: sig,
+                value: token,
+            });
         }
 
         let variables = match &self.target {
@@ -163,13 +163,12 @@ impl TwitchSource {
             .json()
             .context("Could not parse Twitch access token response")?;
 
-        if let Some(errors) = value.get("errors").and_then(|v| v.as_array()) {
-            if let Some(msg) = errors
-                .get(0)
+        if let Some(errors) = value.get("errors").and_then(|v| v.as_array())
+            && let Some(msg) = errors
+                .first()
                 .and_then(|err| err.get("message").and_then(|m| m.as_str()))
-            {
-                bail!("Twitch API error: {msg}");
-            }
+        {
+            bail!("Twitch API error: {msg}");
         }
 
         if let (Some(error), Some(message)) = (

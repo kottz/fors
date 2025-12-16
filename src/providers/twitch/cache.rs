@@ -39,7 +39,7 @@ pub struct Cache {
 impl Cache {
     pub fn new() -> Result<Self> {
         let path = dirs::cache_dir()
-            .unwrap_or_else(|| std::env::temp_dir())
+            .unwrap_or_else(std::env::temp_dir)
             .join("fors")
             .join("twitch_cache.json");
 

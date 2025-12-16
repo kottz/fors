@@ -50,6 +50,10 @@ struct Cli {
     /// Use on-disk cache to speed up startup (tokens/playlists)
     #[arg(long, action = ArgAction::SetTrue)]
     cache: bool,
+
+    /// Log Twitch ad state transitions and playlist handling
+    #[arg(long, action = ArgAction::SetTrue)]
+    debug_ads: bool,
 }
 
 fn main() -> Result<()> {
@@ -91,6 +95,7 @@ fn main() -> Result<()> {
         &mut writer,
         streams.is_live,
         streams.low_latency,
+        cli.debug_ads,
     )?;
 
     Ok(())

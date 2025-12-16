@@ -1,10 +1,14 @@
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use reqwest::blocking::Client;
-use std::collections::HashSet;
 use std::io::Write;
 use std::time::Duration;
 use url::Url;
+
+#[cfg(test)]
+mod tests;
+pub mod twitch_policy;
+use crate::hls::twitch_policy::TwitchHlsPolicy;
 
 #[derive(Debug, Clone)]
 pub struct StreamVariant {
@@ -18,28 +22,23 @@ pub struct StreamVariant {
 }
 
 #[derive(Debug)]
-struct MediaPlaylist {
-    target_duration: f64,
-    end_list: bool,
-    segments: Vec<MediaSegment>,
-    ads: Vec<AdNotice>,
+pub struct MediaPlaylist {
+    pub target_duration: f64,
+    pub end_list: bool,
+    pub segments: Vec<MediaSegment>,
+    pub ads_active: bool,
+    pub ad_daterange: Option<(Option<String>, Option<f64>)>,
 }
 
 #[derive(Debug)]
-struct MediaSegment {
-    uri: Url,
-    init: Option<Url>,
-    sequence: u64,
-    duration: f64,
-    prefetch: bool,
-    ad: bool,
-    discontinuity: bool,
-}
-
-#[derive(Debug)]
-struct AdNotice {
-    id: String,
-    duration: Option<f64>,
+pub struct MediaSegment {
+    pub uri: Url,
+    pub init: Option<Url>,
+    pub sequence: u64,
+    pub duration: f64,
+    pub prefetch: bool,
+    pub ad: bool,
+    pub discontinuity: bool,
 }
 
 pub fn parse_master_playlist(base_url: &Url, body: &str) -> Result<Vec<StreamVariant>> {
@@ -121,14 +120,15 @@ pub fn stream_to_writer(
     writer: &mut dyn Write,
     is_live: bool,
     low_latency: bool,
+    debug_ads: bool,
 ) -> Result<()> {
     let mut last_sequence: Option<u64> = None;
     let mut current_url = media_url.clone();
-    let mut logged_ads: HashSet<String> = HashSet::new();
-    let mut had_content = false;
     let mut consecutive_errors = 0u32;
     let mut last_init: Option<Url> = None;
     let mut initial = true;
+    let mut in_ads = false;
+    let mut had_content = false;
 
     loop {
         let response = match client.get(current_url.clone()).send() {
@@ -167,7 +167,7 @@ pub fn stream_to_writer(
 
         let playlist_url = response.url().clone();
         let body = response.text().context("Reading media playlist failed")?;
-        let playlist = match parse_media_playlist(&playlist_url, &body, low_latency) {
+        let playlist = match parse_media_playlist(&playlist_url, &body, low_latency, debug_ads) {
             Ok(pl) => pl,
             Err(err) => {
                 consecutive_errors += 1;
@@ -180,6 +180,32 @@ pub fn stream_to_writer(
                 continue;
             }
         };
+
+        if !in_ads && playlist.ads_active {
+            in_ads = true;
+            if let Some((_, Some(duration))) = &playlist.ad_daterange {
+                info!("Entering ad break ({}s)", duration.ceil() as u64);
+            } else {
+                info!("Entering ad break");
+            }
+        }
+
+        if in_ads && !playlist.ads_active {
+            in_ads = false;
+            info!("Exiting ad break");
+            if had_content {
+                if let Some(max_seq) = playlist.segments.iter().map(|s| s.sequence).max() {
+                    let live_edge = if low_latency { 2 } else { 3 };
+                    last_sequence = Some(max_seq.saturating_sub(live_edge));
+                } else {
+                    last_sequence = None;
+                }
+                last_init = None;
+            } else {
+                last_sequence = None;
+                last_init = None;
+            }
+        }
 
         let mut wrote_segment = false;
 
@@ -197,31 +223,29 @@ pub fn stream_to_writer(
             initial = false;
         }
 
-        for ad in &playlist.ads {
-            if logged_ads.insert(ad.id.clone()) {
-                if let Some(duration) = ad.duration {
-                    info!(
-                        "Detected advertisement break of {} second{}",
-                        duration.ceil() as u64,
-                        if duration.ceil() as u64 == 1 { "" } else { "s" },
-                    );
-                } else {
-                    info!("Detected advertisement break");
-                }
-            }
-        }
-
         let mut warned_discontinuity = false;
         for segment in &playlist.segments {
-            if let Some(last) = last_sequence {
-                if segment.sequence <= last {
-                    continue;
-                }
+            if segment.discontinuity && !in_ads {
+                last_sequence = None;
+                last_init = None;
+            }
+
+            if let Some(last) = last_sequence
+                && segment.sequence <= last
+            {
+                continue;
             }
 
             if segment.ad {
-                // stay silent during ad segments but keep polling playlists
-                if segment.discontinuity && !warned_discontinuity {
+                if debug_ads {
+                    info!(
+                        "[ads] skipping ad segment seq={}{} uri={}",
+                        segment.sequence,
+                        if segment.prefetch { " (prefetch)" } else { "" },
+                        segment.uri
+                    );
+                }
+                if !in_ads && segment.discontinuity && !warned_discontinuity {
                     log::warn!("Encountered a stream discontinuity while filtering ads");
                     warned_discontinuity = true;
                 }
@@ -276,6 +300,13 @@ pub fn stream_to_writer(
             std::io::copy(&mut segment_response, writer)
                 .context("Writing segment to output failed")?;
             writer.flush().ok();
+            if debug_ads {
+                info!(
+                    "[ads] advanced to sequence {}{}",
+                    segment.sequence,
+                    if segment.prefetch { " (prefetch)" } else { "" }
+                );
+            }
             last_sequence = Some(segment.sequence);
             if !had_content {
                 had_content = true;
@@ -291,32 +322,39 @@ pub fn stream_to_writer(
         }
 
         if !is_live && !wrote_segment {
-            // VOD without end marker, break after one empty reload
             break;
         }
 
         current_url = playlist_url;
-        // Use last real segment duration when available; otherwise target duration scaled
-        let last_dur = playlist
+        let last_real_duration = playlist
             .segments
             .iter()
             .rev()
             .find(|s| s.duration > 0.0)
-            .map(|s| s.duration)
-            .unwrap_or(playlist.target_duration);
-        let reload = if low_latency {
-            last_dur
+            .map(|s| s.duration);
+        let reload = if in_ads {
+            0.5
+        } else if low_latency {
+            last_real_duration.unwrap_or(playlist.target_duration)
         } else {
             playlist.target_duration * 0.75
         };
-        let sleep_ms = ((reload * 1000.0).max(300.0)) as u64;
+        if debug_ads {
+            info!("[ads] polling every {:.3}s (ads_active={})", reload, in_ads);
+        }
+        let sleep_ms = (reload * 1000.0) as u64;
         std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
     Ok(())
 }
 
-fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result<MediaPlaylist> {
+fn parse_media_playlist(
+    base_url: &Url,
+    body: &str,
+    low_latency: bool,
+    debug_ads: bool,
+) -> Result<MediaPlaylist> {
     let mut target_duration = 4.0;
     let mut media_sequence: u64 = 0;
     let mut end_list = false;
@@ -325,22 +363,21 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
     let mut pending_title: Option<String> = None;
     let mut last_duration: Option<f64> = None;
     let mut discontinuity_next = false;
-    let mut ad_state: Option<AdState> = None;
-    let mut ads = Vec::new();
     let mut current_init: Option<Url> = None;
+    let mut policy = TwitchHlsPolicy::new();
 
     for line in body.lines().map(str::trim) {
         if line.starts_with("#EXT-X-TARGETDURATION:") {
-            if let Some(value) = line.split_once(':').map(|(_, v)| v) {
-                if let Ok(parsed) = value.parse::<f64>() {
-                    target_duration = parsed;
-                }
+            if let Some(value) = line.split_once(':').map(|(_, v)| v)
+                && let Ok(parsed) = value.parse::<f64>()
+            {
+                target_duration = parsed;
             }
         } else if line.starts_with("#EXT-X-MEDIA-SEQUENCE:") {
-            if let Some(value) = line.split_once(':').map(|(_, v)| v) {
-                if let Ok(parsed) = value.parse::<u64>() {
-                    media_sequence = parsed;
-                }
+            if let Some(value) = line.split_once(':').map(|(_, v)| v)
+                && let Ok(parsed) = value.parse::<u64>()
+            {
+                media_sequence = parsed;
             }
         } else if line.starts_with("#EXTINF:") {
             let value = line.trim_start_matches("#EXTINF:");
@@ -363,7 +400,14 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
                 .with_context(|| format!("Resolving prefetch segment URL: {line}"))?;
             let sequence = media_sequence + segments.len() as u64;
             let duration = last_duration.unwrap_or(target_duration);
-            let ad_flag = consume_ad_state(&mut ad_state);
+            let ad_flag = policy.classify_segment(&uri, None, true);
+            if debug_ads {
+                info!(
+                    "[ads] segment={} classified={} prefetch=true",
+                    sequence,
+                    if ad_flag { "AD" } else { "CONTENT" }
+                );
+            }
             segments.push(MediaSegment {
                 uri,
                 init: current_init.clone(),
@@ -378,14 +422,20 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             }
             continue;
         } else if line.starts_with("#EXT-X-DATERANGE:") {
-            if let Some(ad) = parse_daterange(line, last_duration, target_duration) {
-                if let Some(id) = ad.id.clone() {
-                    ads.push(AdNotice {
-                        id,
-                        duration: ad.duration,
-                    });
+            let attrs = parse_attribute_line(line.trim_start_matches("#EXT-X-DATERANGE:"));
+            policy.on_daterange(&attrs);
+            if debug_ads && let Some((id, duration)) = policy.last_daterange.clone() {
+                match duration {
+                    Some(d) => info!(
+                        "[ads] playlist contains stitched ad daterange id={} duration={:.0}",
+                        id.unwrap_or_else(|| "unknown".into()),
+                        d
+                    ),
+                    None => info!(
+                        "[ads] playlist contains stitched ad daterange id={} duration=unknown",
+                        id.unwrap_or_else(|| "unknown".into()),
+                    ),
                 }
-                ad_state = Some(ad);
             }
         } else if line.starts_with("#EXT-X-ENDLIST") {
             end_list = true;
@@ -402,12 +452,14 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
             let uri = resolve_url(base_url, line)
                 .with_context(|| format!("Resolving segment URL: {line}"))?;
             let sequence = media_sequence + segments.len() as u64;
-            let mut ad_flag = consume_ad_state(&mut ad_state);
-            if let Some(t) = pending_title.take() {
-                let t_low = t.to_ascii_lowercase();
-                if t_low.contains("amazon") || t_low.contains("stitched-ad") {
-                    ad_flag = true;
-                }
+            let title = pending_title.take();
+            let ad_flag = policy.classify_segment(&uri, title.as_deref(), false);
+            if debug_ads {
+                info!(
+                    "[ads] segment={} classified={} prefetch=false",
+                    sequence,
+                    if ad_flag { "AD" } else { "CONTENT" }
+                );
             }
             segments.push(MediaSegment {
                 uri,
@@ -428,11 +480,14 @@ fn parse_media_playlist(base_url: &Url, body: &str, low_latency: bool) -> Result
         bail!("No segments found in media playlist");
     }
 
+    let ads_active = segments.iter().any(|s| s.ad);
+
     Ok(MediaPlaylist {
         target_duration,
         end_list,
         segments,
-        ads,
+        ads_active,
+        ad_daterange: policy.last_daterange,
     })
 }
 
@@ -478,73 +533,6 @@ fn parse_attribute_line(value: &str) -> Vec<(String, String)> {
             })
         })
         .collect()
-}
-
-#[derive(Debug, Clone)]
-struct AdState {
-    remaining_segments: u32,
-    id: Option<String>,
-    duration: Option<f64>,
-    // no exact daterange timing, but track presence
-}
-
-fn consume_ad_state(ad_state: &mut Option<AdState>) -> bool {
-    if let Some(state) = ad_state.as_mut() {
-        if state.remaining_segments > 0 {
-            state.remaining_segments -= 1;
-        }
-        if state.remaining_segments == 0 {
-            *ad_state = None;
-        }
-        true
-    } else {
-        false
-    }
-}
-
-fn parse_daterange(
-    line: &str,
-    last_duration: Option<f64>,
-    target_duration: f64,
-) -> Option<AdState> {
-    let attrs = line.trim_start_matches("#EXT-X-DATERANGE:");
-    let pairs = parse_attribute_line(attrs);
-    let mut class = None;
-    let mut id = None;
-    let mut duration = None;
-    let mut ad_id = None;
-
-    for (k, v) in pairs {
-        match k.as_str() {
-            "CLASS" => class = Some(v),
-            "ID" => id = Some(v),
-            "DURATION" => duration = v.parse::<f64>().ok(),
-            "X-TV-TWITCH-AD-COMMERCIAL-ID" | "X-TV-TWITCH-AD-ROLL-TYPE" => ad_id = Some(v),
-            _ => {}
-        }
-    }
-
-    let is_ad = class.as_deref() == Some("twitch-stitched-ad")
-        || id
-            .as_deref()
-            .map(|id| id.starts_with("stitched-ad-"))
-            .unwrap_or(false);
-
-    if !is_ad {
-        return None;
-    }
-
-    let seg_duration = last_duration.unwrap_or(target_duration).max(0.1);
-    let remaining_segments = duration
-        .map(|d| (d / seg_duration).ceil() as u32)
-        .filter(|n| *n > 0)
-        .unwrap_or(6);
-
-    Some(AdState {
-        remaining_segments,
-        id: ad_id.or(id),
-        duration,
-    })
 }
 
 fn parse_resolution(value: &str) -> Option<(u64, u64)> {

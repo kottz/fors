@@ -21,9 +21,9 @@ impl YouTubeSource {
     pub fn from_url(url: Url) -> Result<Self> {
         let watch_url = canonical_watch_url(&url)
             .or_else(|| {
-                extract_video_id(&url)
-                    .map(|id| Url::parse(&format!("https://www.youtube.com/watch?v={id}")).ok())
-                    .flatten()
+                extract_video_id(&url).and_then(|id| {
+                    Url::parse(&format!("https://www.youtube.com/watch?v={id}")).ok()
+                })
             })
             .ok_or_else(|| anyhow!("Unsupported YouTube URL"))?;
 
